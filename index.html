@@ -1,0 +1,71 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>⚽ Penalty Shootout</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body {
+      background: #1a1a2e;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      min-height: 100vh;
+      font-family: 'Segoe UI', sans-serif;
+      color: #eee;
+    }
+    h1 {
+      font-size: 1.8rem;
+      margin-bottom: 16px;
+      text-shadow: 0 0 20px #00c853;
+    }
+    #game-container {
+      width: 760px;
+      height: 550px;
+      background: #000;
+      border: 2px solid #00c853;
+      border-radius: 8px;
+      overflow: hidden;
+      box-shadow: 0 0 40px rgba(0,200,83,0.3);
+    }
+    ruffle-player {
+      width: 100%;
+      height: 100%;
+    }
+    p.note {
+      margin-top: 12px;
+      font-size: 0.8rem;
+      color: #888;
+    }
+  </style>
+</head>
+<body>
+  <h1>⚽ Penalty Shootout</h1>
+  <div id="game-container">
+    <ruffle-player id="player"></ruffle-player>
+  </div>
+  <p class="note">Powered by Ruffle · No plugin required</p>
+
+  <!-- Ruffle: open-source Flash emulator, loaded from their CDN -->
+  <script src="https://unpkg.com/@ruffle-rs/ruffle"></script>
+  <script>
+    window.RufflePlayer = window.RufflePlayer || {};
+    window.RufflePlayer.config = {
+      // Use same-origin URLs so relative PHP requests work correctly
+      allowScriptAccess: true,
+      backgroundColor: "#000000",
+      scale: "showAll",
+      quality: "high",
+      wmode: "opaque",
+    };
+
+    window.addEventListener('load', () => {
+      const ruffle = window.RufflePlayer.newest();
+      const player = document.getElementById('player');
+      player.load('/Penalty.swf');
+    });
+  </script>
+</body>
+</html>
