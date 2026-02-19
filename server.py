@@ -1,168 +1,245 @@
 """
-Penalty Shootout — Public Server
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-Real 2-player: shared tables + message relay between players.
-Solo fallback: robot joins after ~3s if no opponent appears.
+Penalty Shootout — Multiplayer Server v3
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Fixes applied vs old server:
 
-Bug fixes:
-  ✓ Names work correctly (read from playerName POST param)
-  ✓ Fresh session uid per player at joinRoom — no collision
-  ✓ Tables are SHARED — two players play each other, not parallel robots
-  ✓ Robot only joins when no human opponent is waiting
+  ✓ SYNC relay fixed — was pushing both playerIndex 0+1 eagerly when either
+    player sent a sync fn. Now correctly pushes only the SENDER'S index to
+    both players. Each player accumulates both sides → sync barrier fires
+    naturally. This was the root cause of "game won't start".
+
+  ✓ NO eager gamePlay push at connect time — let the SWF send it normally
+    via sendGameMessage after PLAYINGSTARTED. Old code double-fired the
+    barrier before the game even rendered.
+
+  ✓ Robot mode: the SWF's §_-7f§ has its own robotSendGameMessage / robot AI.
+    Server just triggers the mode with correct events; it does NOT generate
+    robot AI responses (old server was fighting the SWF's own AI).
+
+  ✓ Robot auto-joins FAST (~6 s / 12 polls) when no other humans in lobby,
+    SLOW (~40 s / 80 polls) when other humans are present so invite can happen.
+
+  ✓ Invite system: inviteToTable.php + rejectTableInvite.php + acceptTableInvite.php.
+    Invites are queued in the target's per-session inbox and delivered on
+    next getMessages poll. Pass targetUID=BOT to invite the robot explicitly.
+
+  ✓ joinTable.php accepts optional tableUID param for invite acceptance.
+
+  ✓ getGameInfo returns ALL tables so the lobby renders every player's avatar.
+
+  ✓ Guest correctly gets JOINTABLERESULT (not OPENTABLERESULT).
+
+  ✓ Random seeds for each PLAYINGSTARTED event.
+
+  ✓ Name persistence: pending_names + IP-address fallback so "Player" default
+    name doesn't reappear on lobby rejoin.
 """
 
-import os, threading, random, struct
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+import os
+import threading
+import random
+import struct
 import urllib.parse
 import xml.etree.ElementTree as ET
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-PORT = int(os.environ.get('PORT', 8080))
+PORT = int(os.environ.get("PORT", 8080))
 
 # ══════════════════════════════════════════════════════════════════════════════
-# §_-8d§ serializer (unchanged from working v21)
+# §_-8d§ serialiser / deserialiser  (unchanged from working original)
 # ══════════════════════════════════════════════════════════════════════════════
 
 def _escape(s):
-    s = str(s).replace('&','&amp;').replace('"','&quot;')
-    return s.replace('<','&lt;').replace('>','&gt;')
+    s = str(s).replace("&", "&amp;").replace('"', "&quot;")
+    return s.replace("<", "&lt;").replace(">", "&gt;")
+
 
 def serialize(val):
-    if val is None:           return '<null />'
-    if isinstance(val, bool): return '<b v="t"/>' if val else '<b v="f"/>'
-    if isinstance(val, int):  return f'<i v="{val}"/>'
+    if val is None:
+        return "<null />"
+    if isinstance(val, bool):
+        return '<b v="t"/>' if val else '<b v="f"/>'
+    if isinstance(val, int):
+        return f'<i v="{val}"/>'
     if isinstance(val, float):
-        b  = struct.pack('<d', val)
-        lo = struct.unpack_from('<I', b, 0)[0]
-        hi = struct.unpack_from('<I', b, 4)[0]
+        b = struct.pack("<d", val)
+        lo = struct.unpack_from("<I", b, 0)[0]
+        hi = struct.unpack_from("<I", b, 4)[0]
         return f'<n v="{hi:08x}{lo:08x}"/>' if hi else f'<n v="{lo:x}"/>'
-    if isinstance(val, str):  return f'<s v="{_escape(val)}"/>'
+    if isinstance(val, str):
+        return f'<s v="{_escape(val)}"/>'
     if isinstance(val, list):
-        return '<a>' + ''.join(serialize(v) for v in val) + '</a>'
+        return "<a>" + "".join(serialize(v) for v in val) + "</a>"
     if isinstance(val, dict):
-        inner = ''.join('<k n="' + _escape(k) + '">' + serialize(v) + '</k>'
-                        for k,v in val.items())
-        return f'<o>{inner}</o>'
+        inner = "".join(
+            '<k n="' + _escape(k) + '">' + serialize(v) + "</k>"
+            for k, v in val.items()
+        )
+        return f"<o>{inner}</o>"
     return f'<s v="{_escape(str(val))}"/>'
 
-def push_node(fn, *params, sync_string=None, player_index=1):
-    env   = {'synchronizeString': sync_string, 'playerIndex': player_index,
-             'message': {'functionName': fn, 'parameters': list(params)}}
-    inner = serialize(env).replace('"', '&quot;')
+
+def push_node(fn, *params, sync_string=None, player_index=0):
+    """Build one GAMEMESSAGERECEIVED XML node for a single playerIndex."""
+    env = {
+        "synchronizeString": sync_string,
+        "playerIndex": player_index,
+        "message": {"functionName": fn, "parameters": list(params)},
+    }
+    inner = serialize(env).replace('"', "&quot;")
     return f'<GAMEMESSAGERECEIVED message="{inner}" />'
 
-def sync_push_pair(fn, *params):
-    return (push_node(fn, *params, sync_string=fn, player_index=0) +
-            push_node(fn, *params, sync_string=fn, player_index=1))
 
 def _parse_node(el):
     t = el.tag
-    if t == 's': return el.get('v','')
-    if t == 'i': return int(el.get('v','0'))
-    if t == 'n':
-        h = el.get('v','0')
-        lo,hi = (int(h[-8:],16), int(h[:-8],16)) if len(h)>8 else (int(h,16), 0)
-        return struct.unpack('<d', struct.pack('<II',lo,hi))[0]
-    if t == 'b': return el.get('v') == 't'
-    if t == 'a': return [_parse_node(c) for c in el]
-    if t == 'o':
+    if t == "s":
+        return el.get("v", "")
+    if t == "i":
+        return int(el.get("v", "0"))
+    if t == "n":
+        h = el.get("v", "0")
+        lo, hi = (
+            (int(h[-8:], 16), int(h[:-8], 16)) if len(h) > 8 else (int(h, 16), 0)
+        )
+        return struct.unpack("<d", struct.pack("<II", lo, hi))[0]
+    if t == "b":
+        return el.get("v") == "t"
+    if t == "a":
+        return [_parse_node(c) for c in el]
+    if t == "o":
         obj = {}
         for k in el:
-            if k.tag == 'k':
+            if k.tag == "k":
                 ch = list(k)
-                obj[k.get('n','')] = _parse_node(ch[0]) if ch else None
+                obj[k.get("n", "")] = _parse_node(ch[0]) if ch else None
         return obj
     return None
 
+
 def deserialize(s):
-    try:    return _parse_node(ET.fromstring(s.strip()))
-    except: return None
+    try:
+        return _parse_node(ET.fromstring(s.strip()))
+    except Exception:
+        return None
+
 
 # ══════════════════════════════════════════════════════════════════════════════
 # Global state
 # ══════════════════════════════════════════════════════════════════════════════
 
 lock          = threading.Lock()
-pending_names = {}   # swf_uid  → name  (bridges checkUser → joinRoom)
-sessions      = {}   # uid      → {'name', 'table_tid'}
-tables        = {}   # tid      → table dict
+pending_names = {}   # uid / '__last__' → name  (checkUser → joinRoom bridge)
+ip_names      = {}   # client_ip → last known name  (rejoin name persistence)
+sessions      = {}   # uid → {name, table_tid, inbox:[]}
+tables        = {}   # tid → table dict
 
-ROBOT_WAIT = 100     # polls before robot joins solo game (~20 sec — gives time for human to join)
+#  Polls before robot auto-joins (each poll ~0.5 s)
+ROBOT_WAIT_SOLO  = 12    # ~6 s  — no other humans in lobby
+ROBOT_WAIT_LOBBY = 80    # ~40 s — other humans present; give time to invite
 
-SYNC_FNS  = {'gamePlay','chooseTeamEnded','startShoot',
-             'homeJerseyIsChosen','awayJerseyIsChosen'}
-ASYNC_FNS = {'opponentShooterShooted','opponentGoalkeeperJumped'}
+#  Game-message function classification
+SYNC_FNS = {
+    "gamePlay",
+    "chooseTeamEnded",
+    "startShoot",
+    "homeJerseyIsChosen",
+    "awayJerseyIsChosen",
+}
+ASYNC_FNS = {
+    "opponentShooterShooted",
+    "opponentGoalkeeperJumped",
+}
 
-# ── table helpers ──────────────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
+# Table helpers
+# ══════════════════════════════════════════════════════════════════════════════
 
 def new_table(tid, host_uid, host_name):
     return dict(
         tid=tid,
         host=host_uid,  host_name=host_name,
         guest=None,     guest_name=None,
-        state='open',           # 'open' | 'playing'
-        host_q=[], guest_q=[],  # per-player message queues
-        wait_polls=0,           # getMessages polls waited without a guest
+        state="open",   # "open" | "playing"
+        host_q=[],      guest_q=[],
+        wait_polls=0,
         robot_mode=False,
-        robot_q=[], robot_score=0,
     )
 
+
 def q_push(table, uid, node):
-    if   uid == table['host']:  table['host_q'].append(node)
-    elif uid == table['guest']: table['guest_q'].append(node)
+    if uid == table["host"]:
+        table["host_q"].append(node)
+    elif uid == table["guest"]:
+        table["guest_q"].append(node)
+
 
 def q_push_both(table, node):
-    table['host_q'].append(node)
-    if table['guest']: table['guest_q'].append(node)
+    table["host_q"].append(node)
+    if table["guest"]:
+        table["guest_q"].append(node)
+
 
 def q_pop(table, uid):
-    if uid == table['host']:
-        out, table['host_q']  = ''.join(table['host_q']),  []
+    if uid == table["host"]:
+        out, table["host_q"] = "".join(table["host_q"]), []
     else:
-        out, table['guest_q'] = ''.join(table['guest_q']), []
+        out, table["guest_q"] = "".join(table["guest_q"]), []
     return out
 
+
 def other_uid(table, uid):
-    return table['guest'] if uid == table['host'] else table['host']
+    return table["guest"] if uid == table["host"] else table["host"]
+
+
+def random_seeds():
+    """Generate random seeds string for PLAYINGSTARTED."""
+    return ",".join(str(random.randint(1, 999999)) for _ in range(2))
+
+
+def wandering_humans(exclude_uid=None):
+    """UIDs of players who have a session but are NOT at any table."""
+    return [
+        uid for uid, s in sessions.items()
+        if not s.get("table_tid") and uid != exclude_uid
+    ]
+
 
 def find_open_table(exclude_uid):
-    """Find a table that a new player can join.
-    Priority 1: genuinely open (waiting for human opponent).
-    Priority 2: robot_mode table where game just started (robot can be replaced).
-    """
-    robot_fallback = None
+    """Return tid of any open, guest-free, non-robot table."""
     for tid, t in tables.items():
-        if t['host'] == exclude_uid or t['guest'] == exclude_uid:
+        if t["host"] == exclude_uid or t["guest"] == exclude_uid:
             continue
-        if t['state'] == 'open' and t['guest'] is None:
-            return tid   # best case — open slot
-        if t['robot_mode'] and t['guest'] is None:
-            robot_fallback = tid  # robot game, human can take over
-    return robot_fallback
+        if t["state"] == "open" and t["guest"] is None and not t["robot_mode"]:
+            return tid
+    return None
+
 
 def leave_table(uid):
-    """Remove uid from their current table. Caller must hold lock."""
+    """Remove uid from their current table.  Caller MUST hold lock."""
     sess = sessions.get(uid)
-    if not sess: return
-    tid = sess.get('table_tid')
+    if not sess:
+        return
+    tid = sess.get("table_tid")
     if not tid or tid not in tables:
-        sess['table_tid'] = None
+        sess["table_tid"] = None
         return
     t = tables[tid]
-    if t['host'] == uid:
-        # Host left — free any guest's reference then delete table
-        if t['guest']:
-            g = sessions.get(t['guest'])
-            if g: g['table_tid'] = None
+    if t["host"] == uid:
+        # Host leaves — detach guest then delete table
+        if t["guest"]:
+            g = sessions.get(t["guest"])
+            if g:
+                g["table_tid"] = None
         del tables[tid]
     else:
-        # Guest left — reset table to open so host can get next opponent (or robot)
-        t['guest'] = t['guest_name'] = None
-        t['guest_q'] = []
-        t['state']      = 'open'
-        t['wait_polls'] = 0
-        t['robot_mode'] = False
-        t['robot_q']    = []
-    sess['table_tid'] = None
+        # Guest leaves — reset table so host can get a new opponent (or robot)
+        t["guest"] = t["guest_name"] = None
+        t["guest_q"] = []
+        t["state"]      = "open"
+        t["wait_polls"] = 0
+        t["robot_mode"] = False
+    sess["table_tid"] = None
+
 
 # ══════════════════════════════════════════════════════════════════════════════
 # HTTP Server
@@ -170,330 +247,537 @@ def leave_table(uid):
 
 class GameServer(BaseHTTPRequestHandler):
 
-    def _hdrs(self, ct='text/xml'):
+    # ── helpers ───────────────────────────────────────────────────────────────
+
+    def _hdrs(self, ct="text/xml"):
         self.send_response(200)
-        self.send_header('Content-Type', ct)
-        self.send_header('Access-Control-Allow-Origin', '*')
-        self.send_header('Access-Control-Allow-Methods', 'GET,POST,OPTIONS')
+        self.send_header("Content-Type", ct)
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Access-Control-Allow-Methods", "GET,POST,OPTIONS")
         self.end_headers()
 
     def _uid(self, p):
-        return p.get('playerUID') or p.get('uid') or 'anon'
+        return p.get("playerUID") or p.get("uid") or "anon"
+
+    def _client_ip(self):
+        fwd = self.headers.get("X-Forwarded-For", "")
+        return fwd.split(",")[0].strip() if fwd else self.client_address[0]
 
     # ── router ────────────────────────────────────────────────────────────────
 
     def _handle(self, p):
-        path = self.path.split('?')[0]
+        path = self.path.split("?")[0]
         uid  = self._uid(p)
-        if   'getGameInfo.php'     in path: return self._get_game_info(uid)
-        elif 'checkUser.php'       in path: return self._check_user(uid, p)
-        elif 'joinRoom.php'        in path: return self._join_room(uid, p)
-        elif 'openTable.php'       in path: self._open_table(uid);     return b''
-        elif 'joinTable.php'       in path: self._join_table(uid);     return b''
-        elif 'getMessages.php'     in path: return self._get_messages(uid).encode()
-        elif 'sendGameMessage.php' in path: self._game_message(uid,p); return b''
-        elif 'leaveTable.php'      in path: self._leave(uid);          return b''
-        elif 'leaveRoom.php'       in path: self._leave(uid);          return b''
-        elif 'gameEnded.php'       in path: self._game_ended(uid,p);   return b''
-        elif 'getMyScore.php'      in path: return b'<root><score>0</score></root>'
-        elif 'getTopTen.php'       in path: return b'<root></root>'
-        else: return b''
+        ip   = self._client_ip()
 
-    # ── endpoints ─────────────────────────────────────────────────────────────
+        if   "getGameInfo.php"       in path: return self._get_game_info(uid)
+        elif "checkUser.php"         in path: return self._check_user(uid, p)
+        elif "joinRoom.php"          in path: return self._join_room(uid, p, ip)
+        elif "openTable.php"         in path: self._open_table(uid);          return b""
+        elif "joinTable.php"         in path: self._join_table(uid, p);       return b""
+        elif "inviteToTable.php"     in path: self._invite_to_table(uid, p);  return b""
+        elif "rejectTableInvite.php" in path: self._reject_invite(uid, p);    return b""
+        elif "acceptTableInvite.php" in path: self._join_table(uid, p);       return b""
+        elif "getMessages.php"       in path: return self._get_messages(uid).encode()
+        elif "sendGameMessage.php"   in path: self._game_message(uid, p);     return b""
+        elif "leaveTable.php"        in path: self._leave(uid);               return b""
+        elif "leaveRoom.php"         in path: self._leave(uid);               return b""
+        elif "gameEnded.php"         in path: self._game_ended(uid, p);       return b""
+        elif "getMyScore.php"        in path: return b"<root><score>0</score></root>"
+        elif "getTopTen.php"         in path: return b"<root></root>"
+        else:                                 return b""
+
+    # ── getGameInfo ───────────────────────────────────────────────────────────
 
     def _get_game_info(self, uid):
+        """
+        Return ALL tables so the lobby can render every player's avatar.
+        Open tables appear as joinable seats; playing tables as in-progress.
+        Always include at least one TABLEINFO so the SWF doesn't crash.
+        """
         with lock:
-            open_tid  = find_open_table(uid)
-            table_uid = open_tid if open_tid else '101'
-            host_uid  = tables[open_tid]['host'] if open_tid else ''
+            n = len(sessions)
+            tinfos = []
+            for t in tables.values():
+                puids = t["host"] + ("," + t["guest"] if t["guest"] else "")
+                playing = "true" if t["state"] == "playing" else "false"
+                tinfos.append(
+                    f'<TABLEINFO tableUID="{t["tid"]}" possibleNoOfPlayers="2" '
+                    f'playerUIDs="{puids}" viewerUIDs="" isPlaying="{playing}" />'
+                )
+            if not tinfos:
+                tinfos = [
+                    '<TABLEINFO tableUID="101" possibleNoOfPlayers="2" '
+                    'playerUIDs="" viewerUIDs="" isPlaying="false" />'
+                ]
         return (
             '<?xml version="1.0" encoding="utf-8"?><root>'
-            '<ROOMINFO roomID="1" roomName="Main Room" '
-            'roomCapacity="100" noOfPlayers="' + str(len(sessions)) + '" />'
-            '<TABLEINFO tableUID="' + table_uid + '" possibleNoOfPlayers="2" '
-            'playerUIDs="' + host_uid + '" viewerUIDs="" isPlaying="false" />'
-            '</root>'
+            f'<ROOMINFO roomID="1" roomName="Main Room" roomCapacity="100" noOfPlayers="{n}" />'
+            + "".join(tinfos)
+            + "</root>"
         ).encode()
 
+    # ── checkUser ─────────────────────────────────────────────────────────────
+
     def _check_user(self, uid, p):
-        name = (p.get('username') or p.get('userName') or
-                p.get('playerName') or 'Player')
+        name = (
+            p.get("username") or p.get("userName")
+            or p.get("playerName") or "Player"
+        )
         with lock:
-            pending_names[uid]        = name   # by specific uid
-            pending_names['__last__'] = name   # wildcard — survives uid mismatch
+            pending_names[uid]        = name
+            pending_names["__last__"] = name
         print(f'checkUser -> "{name}"', flush=True)
         return (
             '<?xml version="1.0" encoding="utf-8"?><root>'
-            '<valid>true</valid>'
-            '<username>' + name + '</username>'
-            '<gender>1</gender><email>x@x.com</email>'
-            '</root>'
+            "<valid>true</valid>"
+            f"<username>{_escape(name)}</username>"
+            "<gender>1</gender><email>x@x.com</email>"
+            "</root>"
         ).encode()
 
-    def _join_room(self, uid, p):
-        name = (p.get('playerName') or p.get('username') or p.get('userName'))
+    # ── joinRoom ──────────────────────────────────────────────────────────────
+
+    def _join_room(self, uid, p, ip):
+        """
+        Accept every param name the SWF might use for the player name,
+        then fall back to the pending_names bridge, then the IP cache,
+        then 'Player'.  Store the resolved name in ip_names so the next
+        rejoin from the same IP won't fall back to 'Player'.
+        """
+        name = (
+            p.get("playerName") or p.get("playerNameInput")
+            or p.get("username") or p.get("userName")
+        )
         with lock:
             if not name:
-                # Try exact uid first, then wildcard __last__
-                name = (pending_names.pop(uid, None) or
-                        pending_names.pop('__last__', None) or
-                        'Player')
+                name = (
+                    pending_names.pop(uid, None)
+                    or pending_names.pop("__last__", None)
+                    or ip_names.get(ip)
+                    or "Player"
+                )
             else:
                 pending_names.pop(uid, None)
-                pending_names.pop('__last__', None)
+                pending_names.pop("__last__", None)
+
+            if name and name != "Player":
+                ip_names[ip] = name          # persist for next rejoin
+
             new_uid = str(random.randint(100000, 999999))
-            sessions[new_uid] = {'name': name, 'table_tid': None}
+            sessions[new_uid] = {"name": name, "table_tid": None, "inbox": []}
+
         print(f'-> "{name}" uid={new_uid}', flush=True)
         return (
             '<?xml version="1.0" encoding="utf-8"?>'
-            '<root success="true" playerUID="' + new_uid + '" '
-            'playerName="' + name + '" playerGender="1" '
+            f'<root success="true" playerUID="{new_uid}" '
+            f'playerName="{_escape(name)}" playerGender="1" '
             'playerNameInput="" playerID="" extraKey="">'
-            '<PLAYERINFO playerUID="' + new_uid + '" playerName="' + name + '" playerGender="1" />'
+            f'<PLAYERINFO playerUID="{new_uid}" playerName="{_escape(name)}" playerGender="1" />'
             '<TABLEINFO tableUID="101" possibleNoOfPlayers="2" '
             'playerUIDs="" viewerUIDs="" isPlaying="false" />'
-            '</root>'
+            "</root>"
         ).encode()
 
+    # ── openTable ─────────────────────────────────────────────────────────────
+
     def _open_table(self, uid):
+        """Player manually creates a table and waits for an opponent or robot."""
         with lock:
             sess = sessions.get(uid)
-            if not sess: return
+            if not sess:
+                return
             leave_table(uid)
-            tid = uid                               # table keyed by host uid
-            tables[tid] = new_table(tid, uid, sess['name'])
-            sess['table_tid'] = tid
+            tid = uid                        # table keyed by host uid
+            tables[tid] = new_table(tid, uid, sess["name"])
+            sess["table_tid"] = tid
             t = tables[tid]
-            t['host_q'].append('<OPENTABLERESULT success="true" tableUID="' + tid + '" />')
-            t['host_q'].append('<PLAYERJOINEDTABLE playerUID="' + uid + '" tableUID="' + tid + '" />')
+            t["host_q"].append(f'<OPENTABLERESULT success="true" tableUID="{tid}" />')
+            t["host_q"].append(f'<PLAYERJOINEDTABLE playerUID="{uid}" tableUID="{tid}" />')
         print(f'-> "{sess["name"]}" opened table — waiting for opponent', flush=True)
 
-    def _join_table(self, uid):
+    # ── joinTable ─────────────────────────────────────────────────────────────
+
+    def _join_table(self, uid, p=None):
+        """
+        Join a table.
+
+        If p contains tableUID (set by invite-acceptance flow),
+        try to join that specific table first.
+        Otherwise find any open table.
+        If none exists, create a solo table; robot joins after delay.
+        """
+        target_tid = p.get("tableUID") if p else None
         with lock:
             sess = sessions.get(uid)
-            if not sess: return
+            if not sess:
+                return
             leave_table(uid)
+
+            # 1) Invited to a specific table?
+            if target_tid and target_tid in tables:
+                t = tables[target_tid]
+                if (
+                    t["state"] == "open"
+                    and t["guest"] is None
+                    and t["host"] != uid
+                    and not t["robot_mode"]
+                ):
+                    self._connect_two_players(target_tid, uid, sess)
+                    return
+
+            # 2) Any open table in the lobby?
             tid = find_open_table(uid)
-            if tid and tid in tables:
-                t = tables[tid]
-                if t['robot_mode']:
-                    # Human takes over from robot — reset robot state first
-                    print(f'  Human "{sess["name"]}" kicking robot from table {tid}', flush=True)
-                    t['robot_mode'] = False
-                    t['robot_q']    = []
-                    t['state']      = 'open'
-                    # Clear any robot-pushed messages in host queue so game resets cleanly
-                    t['host_q']     = []
-                    # Now connect as normal 2-player game
-                    self._connect_two_players(tid, uid, sess)
-                else:
-                    self._connect_two_players(tid, uid, sess)
-            else:
-                # No open table — solo game (robot joins after delay)
-                print(f'  No table found for "{sess["name"]}" -> solo game', flush=True)
-                tid = uid
-                tables[tid] = new_table(tid, uid, sess['name'])
-                sess['table_tid'] = tid
-                t = tables[tid]
-                t['host_q'].append('<OPENTABLERESULT success="true" tableUID="' + tid + '" />')
-                t['host_q'].append('<PLAYERJOINEDTABLE playerUID="' + uid + '" tableUID="' + tid + '" />')
+            if tid:
+                self._connect_two_players(tid, uid, sess)
+                return
+
+            # 3) Create solo table; robot joins later via getMessages logic
+            print(f'  No open table for "{sess["name"]}" → solo table', flush=True)
+            tid = uid
+            tables[tid] = new_table(tid, uid, sess["name"])
+            sess["table_tid"] = tid
+            t = tables[tid]
+            t["host_q"].append(f'<OPENTABLERESULT success="true" tableUID="{tid}" />')
+            t["host_q"].append(f'<PLAYERJOINEDTABLE playerUID="{uid}" tableUID="{tid}" />')
+
+    # ── inviteToTable ─────────────────────────────────────────────────────────
+
+    def _invite_to_table(self, uid, p):
+        """
+        Host invites another player (or the bot) to their table.
+
+        Expected params (server accepts multiple name variants):
+          targetUID / invitedUID / inviteUID / playerUID2 — who to invite
+          tableUID — which table (defaults to host's current table)
+
+        Special: targetUID == "BOT", "ROBOT", or "0" → trigger immediate robot join.
+        """
+        target_uid = (
+            p.get("targetUID") or p.get("invitedUID")
+            or p.get("inviteUID") or p.get("playerUID2")
+        )
+        with lock:
+            sess = sessions.get(uid)
+            if not sess:
+                return
+            table_uid = p.get("tableUID") or sess.get("table_tid")
+            if not table_uid:
+                return
+
+            # ── invite the robot ──────────────────────────────────────────
+            if target_uid in (None, "BOT", "ROBOT", "0", "bot", "robot"):
+                self._robot_join_now(table_uid)
+                return
+
+            inviter_name = sess.get("name", "Player")
+
+            # ── invite a human ────────────────────────────────────────────
+            target_sess = sessions.get(target_uid)
+            if not target_sess:
+                print(f'  Invite: target "{target_uid}" not found', flush=True)
+                return
+            if target_sess.get("table_tid"):
+                # Target already in a game
+                return
+
+            msg = (
+                f'<INVITETOTABLE tableUID="{table_uid}" playerUID="{uid}" '
+                f'playerName="{_escape(inviter_name)}" />'
+            )
+            target_sess.setdefault("inbox", []).append(msg)
+            print(
+                f'  "{inviter_name}" invited uid={target_uid} to table {table_uid}',
+                flush=True,
+            )
+
+    # ── rejectTableInvite ─────────────────────────────────────────────────────
+
+    def _reject_invite(self, uid, p):
+        """
+        Invited player rejects; notify the host via their table queue.
+        Params: tableUID (required), hostUID / inviterUID (fallback lookup).
+        """
+        table_uid = p.get("tableUID")
+        host_uid  = p.get("hostUID") or p.get("inviterUID")
+        with lock:
+            rejecter_name = sessions.get(uid, {}).get("name", "Player")
+            notified = False
+
+            if table_uid and table_uid in tables:
+                tables[table_uid]["host_q"].append(
+                    f'<TABLEINVITEREJECTED playerUID="{uid}" tableUID="{table_uid}" />'
+                )
+                notified = True
+
+            if not notified and host_uid:
+                h_sess = sessions.get(host_uid)
+                if h_sess:
+                    tid = h_sess.get("table_tid")
+                    if tid and tid in tables:
+                        tables[tid]["host_q"].append(
+                            f'<TABLEINVITEREJECTED playerUID="{uid}" tableUID="{tid}" />'
+                        )
+
+        print(f'  "{rejecter_name}" rejected invite to table {table_uid}', flush=True)
+
+    # ── connect two human players ─────────────────────────────────────────────
 
     def _connect_two_players(self, tid, guest_uid, guest_sess):
-        """Wire up a 2-player game. Caller must hold lock."""
+        """Wire up a 2-player game.  Caller MUST hold lock."""
         t = tables[tid]
-        t['guest']      = guest_uid
-        t['guest_name'] = guest_sess['name']
-        t['state']      = 'playing'
-        guest_sess['table_tid'] = tid
-        host_uid   = t['host']
-        host_name  = t['host_name']
-        guest_name = guest_sess['name']
+        t["guest"]      = guest_uid
+        t["guest_name"] = guest_sess["name"]
+        t["state"]      = "playing"
+        guest_sess["table_tid"] = tid
+        host_uid   = t["host"]
+        host_name  = t["host_name"]
+        guest_name = guest_sess["name"]
+        seeds = random_seeds()
 
-        # Host: guest joined + game starts
-        t['host_q'].append('<PLAYERJOINEDTABLE playerUID="' + guest_uid + '" tableUID="' + tid + '" />')
-        t['host_q'].append('<STARTPLAYINGRESULT success="true" />')
-        t['host_q'].append('<PLAYINGSTARTED tableUID="' + tid + '" randomSeeds="123,456" />')
+        # Host learns the guest joined, then game starts
+        t["host_q"].append(
+            f'<PLAYERJOINEDTABLE playerUID="{guest_uid}" tableUID="{tid}" />'
+        )
+        t["host_q"].append('<STARTPLAYINGRESULT success="true" />')
+        t["host_q"].append(f'<PLAYINGSTARTED tableUID="{tid}" randomSeeds="{seeds}" />')
 
-        # Guest: see existing host + themselves + game starts
-        t['guest_q'].append('<OPENTABLERESULT success="true" tableUID="' + tid + '" />')
-        t['guest_q'].append('<PLAYERJOINEDTABLE playerUID="' + host_uid + '" tableUID="' + tid + '" />')
-        t['guest_q'].append('<PLAYERJOINEDTABLE playerUID="' + guest_uid + '" tableUID="' + tid + '" />')
-        t['guest_q'].append('<STARTPLAYINGRESULT success="true" />')
-        t['guest_q'].append('<PLAYINGSTARTED tableUID="' + tid + '" randomSeeds="123,456" />')
+        # Guest sees the host already at the table, then itself, then game starts.
+        # Guest gets JOINTABLERESULT — it didn't open this table.
+        t["guest_q"].append(f'<JOINTABLERESULT success="true" tableUID="{tid}" />')
+        t["guest_q"].append(
+            f'<PLAYERJOINEDTABLE playerUID="{host_uid}" tableUID="{tid}" />'
+        )
+        t["guest_q"].append(
+            f'<PLAYERJOINEDTABLE playerUID="{guest_uid}" tableUID="{tid}" />'
+        )
+        t["guest_q"].append('<STARTPLAYINGRESULT success="true" />')
+        t["guest_q"].append(f'<PLAYINGSTARTED tableUID="{tid}" randomSeeds="{seeds}" />')
 
-        # First sync gamePlay for both players
-        pair = sync_push_pair('gamePlay')
-        t['host_q'].append(pair)
-        t['guest_q'].append(pair)
+        # ── CRITICAL: do NOT push gamePlay here ──────────────────────────────
+        # After PLAYINGSTARTED the SWF sends gamePlay via sendGameMessage.
+        # _relay() will push each sender's playerIndex to BOTH players.
+        # Each player accumulates index 0 + index 1 → sync barrier fires.
+        # Pushing an eager pair here broke the old server.
 
         print(f'MULTIPLAYER: "{host_name}" vs "{guest_name}"', flush=True)
+
+    # ── robot join ────────────────────────────────────────────────────────────
+
+    def _robot_join_now(self, tid):
+        """
+        Trigger immediate robot join on a specific table.
+        The SWF (§_-7f§) has its own built-in robot AI driven by
+        robotSendGameMessage — the server never needs to generate moves.
+        Caller MUST hold lock.
+        """
+        if tid not in tables:
+            return
+        t = tables[tid]
+        if t["state"] != "open" or t["robot_mode"]:
+            return
+        t["robot_mode"] = True
+        t["state"]      = "playing"
+        seeds = random_seeds()
+        t["host_q"].append('<ROBOTJOINTABLERESULT success="true" />')
+        t["host_q"].append(f'<ROBOTJOINEDTABLE tableUID="{tid}" />')
+        t["host_q"].append('<STARTPLAYINGRESULT success="true" />')
+        t["host_q"].append(f'<PLAYINGSTARTED tableUID="{tid}" randomSeeds="{seeds}" />')
+        print(f'ROBOT joined table {tid}', flush=True)
+
+    # ── getMessages (polling loop) ────────────────────────────────────────────
 
     def _get_messages(self, uid):
         with lock:
             sess = sessions.get(uid)
-            if not sess: return ''
-            tid = sess.get('table_tid')
-            if not tid or tid not in tables: return ''
+            if not sess:
+                return ""
+
+            # ── Inbox: invites / rejections for wandering players ──────────
+            inbox = sess.get("inbox")
+            if inbox:
+                out = "".join(inbox)
+                sess["inbox"] = []
+                return out
+
+            tid = sess.get("table_tid")
+            if not tid or tid not in tables:
+                return ""
             t = tables[tid]
 
-            # Solo: robot joins after ROBOT_WAIT polls
-            if t['state'] == 'open' and not t['robot_mode']:
-                t['wait_polls'] += 1
-                if t['wait_polls'] >= ROBOT_WAIT:
-                    t['robot_mode'] = True
-                    t['state']      = 'playing'
-                    t['host_q'].append('<ROBOTJOINTABLERESULT success="true" />')
-                    t['host_q'].append('<ROBOTJOINEDTABLE tableUID="' + tid + '" />')
-                    t['host_q'].append('<STARTPLAYINGRESULT success="true" />')
-                    t['host_q'].append('<PLAYINGSTARTED tableUID="' + tid + '" randomSeeds="123,456" />')
-                    t['robot_q'] = [('sync','gamePlay')]
-                    print(f'ROBOT joined table {tid} (solo)', flush=True)
-
-            # Robot AI: one action per poll
-            if t['robot_mode'] and t['robot_q']:
-                mode, fn = t['robot_q'][0][0], t['robot_q'][0][1]
-                args     = t['robot_q'].pop(0)[2:]
-                node     = sync_push_pair(fn,*args) if mode=='sync' else \
-                           push_node(fn,*args,sync_string=None,player_index=1)
-                t['host_q'].append(node)
-                print(f'  [{mode}] {fn}', flush=True)
+            # ── Auto robot-join (only the host polls count) ────────────────
+            if t["state"] == "open" and not t["robot_mode"] and t["host"] == uid:
+                t["wait_polls"] += 1
+                wanderers = wandering_humans(exclude_uid=uid)
+                limit = ROBOT_WAIT_LOBBY if wanderers else ROBOT_WAIT_SOLO
+                if t["wait_polls"] >= limit:
+                    self._robot_join_now(tid)
 
             return q_pop(t, uid)
 
+    # ── sendGameMessage ───────────────────────────────────────────────────────
+
     def _game_message(self, uid, p):
-        raw = p.get('message','')
-        if not raw: return
+        raw = p.get("message", "")
+        if not raw:
+            return
         obj = deserialize(raw)
-        if obj is None: return
-        # Unwrap envelope
-        if isinstance(obj, dict) and 'message' in obj:
-            obj = obj['message']
-        fn     = obj.get('functionName','') if isinstance(obj,dict) else ''
-        params = obj.get('parameters',[])   if isinstance(obj,dict) else []
+        if obj is None:
+            return
+
+        # Unwrap envelope layers the SWF may add
+        if isinstance(obj, dict) and "message" in obj:
+            obj = obj["message"]
+        fn     = obj.get("functionName", "") if isinstance(obj, dict) else ""
+        params = obj.get("parameters", [])   if isinstance(obj, dict) else []
         if not fn and isinstance(obj, list) and obj:
             inner = obj[0]
-            if isinstance(inner,dict) and 'message' in inner: inner = inner['message']
-            fn     = inner.get('functionName','') if isinstance(inner,dict) else ''
-            params = inner.get('parameters',[])   if isinstance(inner,dict) else []
-        if not fn: return
+            if isinstance(inner, dict) and "message" in inner:
+                inner = inner["message"]
+            fn     = inner.get("functionName", "") if isinstance(inner, dict) else ""
+            params = inner.get("parameters", [])   if isinstance(inner, dict) else []
+        if not fn:
+            return
 
         with lock:
             sess = sessions.get(uid)
-            if not sess: return
-            tid = sess.get('table_tid')
-            if not tid or tid not in tables: return
+            if not sess:
+                return
+            tid = sess.get("table_tid")
+            if not tid or tid not in tables:
+                return
             t = tables[tid]
-            if t['robot_mode']:
-                self._robot_respond(t, fn, params)
+
+            if t["robot_mode"]:
+                # SWF runs its own robot AI — server does nothing here.
+                pass
             else:
                 self._relay(t, uid, fn, params)
-        print(f'  {sessions.get(uid,{}).get("name","?")} -> {fn}', flush=True)
 
-    # ── 2-player message relay ─────────────────────────────────────────────────
+        print(f'  {sessions.get(uid, {}).get("name", "?")} -> {fn}', flush=True)
+
+    # ── relay (2-player game messages) ───────────────────────────────────────
 
     def _relay(self, t, uid, fn, params):
+        """
+        Relay game messages correctly between two human players.
+
+        SYNC functions (gamePlay, chooseTeamEnded, startShoot, …):
+          The NovelGames sync barrier fires when each player has received
+          a message with BOTH playerIndex 0 and playerIndex 1.
+
+          Correct flow:
+            Player A sends fn → server pushes playerIndex=0 to BOTH A and B
+            Player B sends fn → server pushes playerIndex=1 to BOTH A and B
+            Each player now has both indices → barrier fires → game advances
+
+          OLD BROKEN behaviour:
+            When either player sent fn → server pushed BOTH indices to BOTH
+            players immediately → barrier fired before other player sent fn
+            → game state desync / game appeared to hang.
+
+        ASYNC functions (opponentShooterShooted, opponentGoalkeeperJumped):
+          One-directional: only the other player receives it.
+        """
+        sender_idx = 0 if uid == t["host"] else 1
         other = other_uid(t, uid)
-        sender_idx = 0 if uid == t['host'] else 1
+
         if fn in SYNC_FNS:
-            # Both playerIndex 0+1 to BOTH players so sync barrier fires for each
-            pair = sync_push_pair(fn, *params)
-            q_push_both(t, pair)
+            # Push sender's index to BOTH players
+            node = push_node(fn, *params, sync_string=fn, player_index=sender_idx)
+            q_push_both(t, node)
+
         elif fn in ASYNC_FNS:
-            # One-directional: relay to OTHER player with sender's index
+            # Push to the OTHER player only
             if other:
                 node = push_node(fn, *params, sync_string=None, player_index=sender_idx)
                 q_push(t, other, node)
 
-    # ── robot AI ──────────────────────────────────────────────────────────────
-
-    def _robot_respond(self, t, fn, params):
-        if fn == 'gamePlay':
-            if not t['robot_q']:
-                t['robot_q'].append(('sync','gamePlay'))
-        elif fn == 'chooseTeamEnded':
-            t0 = int(params[0]) if params else 0
-            t1 = int(params[1]) if len(params)>1 else 1
-            if t0 == t1:
-                t['robot_q'].append(('async','homeJerseyIsChosen'))
-        elif fn == 'startShoot':
-            t['robot_q'].append(('async','opponentShooterShooted',
-                                  random.uniform(250,550), random.uniform(80,200)))
-        elif fn == 'opponentShooterShooted':
-            t['robot_q'].append(('async','opponentGoalkeeperJumped',
-                                  random.uniform(200,600), random.uniform(100,220),
-                                  float(random.randint(150,500))))
-        elif fn == 'opponentGoal':
-            t['robot_score'] = t.get('robot_score',0) + 1
-            print(f'  Robot scored ({t["robot_score"]})', flush=True)
-        elif fn == 'opponentMissed':
-            print('  Robot missed', flush=True)
-
-    # ── leave / end ───────────────────────────────────────────────────────────
+    # ── leave / game end ──────────────────────────────────────────────────────
 
     def _leave(self, uid):
         with lock:
-            name = sessions.get(uid,{}).get('name','?')
+            name = sessions.get(uid, {}).get("name", "?")
             leave_table(uid)
             sessions.pop(uid, None)
         print(f'"{name}" left', flush=True)
 
     def _game_ended(self, uid, p):
-        ranks = p.get('ranks','?')
-        name  = sessions.get(uid,{}).get('name','Player')
+        ranks = p.get("ranks", "?")
+        name  = sessions.get(uid, {}).get("name", "Player")
         try:
-            r = [int(x) for x in ranks.split(',')]
-            print(f'WINNER: {"" + name if r[0]==0 else "Opponent/Robot"}', flush=True)
-        except: pass
-        with lock: leave_table(uid)
+            r = [int(x) for x in ranks.split(",")]
+            winner = name if r[0] == 0 else "Opponent/Robot"
+            print(f'WINNER: "{winner}"', flush=True)
+        except Exception:
+            pass
+        with lock:
+            leave_table(uid)
 
-    # ── HTTP ─────────────────────────────────────────────────────────────────
+    # ── HTTP plumbing ─────────────────────────────────────────────────────────
 
-    def do_OPTIONS(self): self._hdrs()
+    def do_OPTIONS(self):
+        self._hdrs()
 
     def do_POST(self):
-        n    = int(self.headers.get('Content-Length',0))
-        body = self.rfile.read(n).decode('utf-8','replace')
-        p    = {k: v[0] for k,v in urllib.parse.parse_qs(body).items()}
+        n    = int(self.headers.get("Content-Length", 0))
+        body = self.rfile.read(n).decode("utf-8", "replace")
+        p    = {k: v[0] for k, v in urllib.parse.parse_qs(body).items()}
         self._hdrs()
-        self.wfile.write(self._handle(p))
+        result = self._handle(p)
+        self.wfile.write(result if result is not None else b"")
 
     def do_GET(self):
-        path = self.path.split('?')[0]
-        qs   = urllib.parse.parse_qs(self.path.split('?')[1] if '?' in self.path else '')
-        p    = {k: v[0] for k,v in qs.items()}
+        path   = self.path.split("?")[0]
+        qs_str = self.path.split("?")[1] if "?" in self.path else ""
+        p      = {k: v[0] for k, v in urllib.parse.parse_qs(qs_str).items()}
 
-        if path == '/Penalty.swf':
-            swf = os.path.join(os.path.dirname(os.path.abspath(__file__)),'Penalty.swf')
+        if path == "/Penalty.swf":
+            swf = os.path.join(os.path.dirname(os.path.abspath(__file__)), "Penalty.swf")
             if not os.path.exists(swf):
-                self.send_response(404); self.end_headers()
-                self.wfile.write(b'Penalty.swf not found'); return
-            with open(swf,'rb') as f: data = f.read()
+                self.send_response(404)
+                self.end_headers()
+                self.wfile.write(b"Penalty.swf not found")
+                return
+            with open(swf, "rb") as f:
+                data = f.read()
             self.send_response(200)
-            self.send_header('Content-Type','application/x-shockwave-flash')
-            self.send_header('Content-Length',str(len(data)))
-            self.send_header('Access-Control-Allow-Origin','*')
-            self.end_headers(); self.wfile.write(data); return
+            self.send_header("Content-Type", "application/x-shockwave-flash")
+            self.send_header("Content-Length", str(len(data)))
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.end_headers()
+            self.wfile.write(data)
+            return
 
-        if 'crossdomain.xml' in path:
+        if "crossdomain.xml" in path:
             self._hdrs()
-            self.wfile.write(b'<?xml version="1.0"?><cross-domain-policy>'
-                             b'<allow-access-from domain="*"/></cross-domain-policy>'); return
+            self.wfile.write(
+                b'<?xml version="1.0"?><cross-domain-policy>'
+                b'<allow-access-from domain="*"/></cross-domain-policy>'
+            )
+            return
 
-        if '.php' in path:
-            self._hdrs(); self.wfile.write(self._handle(p)); return
+        if ".php" in path:
+            self._hdrs()
+            result = self._handle(p)
+            self.wfile.write(result if result is not None else b"")
+            return
 
         # Landing page
-        host = self.headers.get('Host','localhost')
+        host = self.headers.get("Host", "localhost")
         self.send_response(200)
-        self.send_header('Content-Type','text/html; charset=utf-8')
-        self.send_header('Access-Control-Allow-Origin','*')
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Access-Control-Allow-Origin", "*")
         self.end_headers()
-        page = LANDING.replace('__HOST__', host)
-        self.wfile.write(page.encode())
+        self.wfile.write(LANDING.replace("__HOST__", host).encode())
 
     def log_message(self, fmt, *args):
-        print(f'  {self.address_string()} {fmt%args}', flush=True)
+        print(f"  {self.address_string()} {fmt % args}", flush=True)
 
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Landing page
+# ══════════════════════════════════════════════════════════════════════════════
 
 LANDING = """<!DOCTYPE html><html><head>
 <meta charset="UTF-8"><title>Penalty Shootout</title>
@@ -504,7 +788,7 @@ LANDING = """<!DOCTYPE html><html><head>
        justify-content:center;min-height:100vh;gap:24px;padding:24px}
   h1{font-size:2.2rem;color:#00e676}
   .box{background:#0d0d1a;border:1px solid #333;border-radius:10px;
-       padding:24px 28px;max-width:580px;width:100%;line-height:1.85}
+       padding:24px 28px;max-width:600px;width:100%;line-height:1.85}
   .box h2{font-size:1rem;color:#00e676;margin-bottom:12px;letter-spacing:.05em}
   .badge{display:inline-block;background:#00e676;color:#000;font-size:.7rem;
          padding:1px 6px;border-radius:3px;margin-left:6px;vertical-align:middle}
@@ -518,8 +802,20 @@ LANDING = """<!DOCTYPE html><html><head>
         padding:6px 14px;border-radius:4px;font-size:.85rem}
   .dl a:hover{background:#00e676;color:#000;text-decoration:none}
   .note{color:#888;font-size:.8rem;margin-top:10px}
+  .tip{background:#0a2a0a;border:1px solid #1a7a1a;border-radius:6px;
+       padding:12px 16px;margin-top:8px;font-size:.85rem;color:#aaffaa;line-height:1.7}
 </style></head><body>
 <h1>&#9917; Penalty Shootout</h1>
+<div class="box">
+  <h2>HOW MULTIPLAYER WORKS</h2>
+  <div class="tip">
+    &#x2022; Open the game &mdash; you appear as a wandering player in the lobby.<br>
+    &#x2022; <b>Click another player&rsquo;s avatar</b> to send them an invite.<br>
+    &#x2022; They can <b>accept</b> (game starts) or <b>decline</b> (you can re-invite or invite the bot).<br>
+    &#x2022; If you are the <b>only player online</b>, a robot joins automatically in ~6 s.<br>
+    &#x2022; If other players are online, the robot waits ~40 s to give you time to invite first.
+  </div>
+</div>
 <div class="box">
   <h2>OPTION 1 &middot; Flash Player Standalone <span class="badge">RECOMMENDED</span></h2>
   <ol>
@@ -533,25 +829,25 @@ LANDING = """<!DOCTYPE html><html><head>
     <li>Paste this URL and press Enter:</li>
   </ol>
   <span class="url">http://__HOST__/Penalty.swf</span>
-  <p class="note">No install needed &mdash; just run the .exe / .dmg directly</p>
+  <p class="note">No install &mdash; run the .exe / .dmg directly</p>
 </div>
 <div class="box">
   <h2>OPTION 2 &middot; Pale Moon Browser</h2>
   <ol>
-    <li>Download <a href="https://www.palemoon.org/download.shtml" target="_blank">Pale Moon browser</a> and install it</li>
-    <li>Enable Flash: Menu &rarr; <b>Add-ons</b> &rarr; <b>Plugins</b> &rarr; Shockwave Flash &rarr; <b>Always Activate</b></li>
-    <li>Open this URL in Pale Moon:</li>
+    <li>Download <a href="https://www.palemoon.org/download.shtml" target="_blank">Pale Moon</a></li>
+    <li>Enable Flash: Menu &rarr; <b>Add-ons &rarr; Plugins &rarr; Shockwave Flash &rarr; Always Activate</b></li>
+    <li>Open in Pale Moon:</li>
   </ol>
   <span class="url">http://__HOST__/Penalty.swf</span>
-  <p class="note">Full guide: <a href="https://andkon.com/arcade/faq.php" target="_blank">andkon.com/arcade/faq.php</a></p>
 </div>
 </body></html>"""
 
 
-if __name__ == '__main__':
-    print('='*60, flush=True)
-    print('PENALTY SHOOTOUT — PUBLIC SERVER', flush=True)
-    print(f'http://0.0.0.0:{PORT}', flush=True)
-    print('Solo vs robot  |  Real 2-player relay', flush=True)
-    print('='*60, flush=True)
-    ThreadingHTTPServer(('0.0.0.0', PORT), GameServer).serve_forever()
+# ══════════════════════════════════════════════════════════════════════════════
+if __name__ == "__main__":
+    print("=" * 60, flush=True)
+    print("PENALTY SHOOTOUT — MULTIPLAYER SERVER v3", flush=True)
+    print(f"http://0.0.0.0:{PORT}", flush=True)
+    print("Solo vs robot  |  2-player relay  |  Invite system", flush=True)
+    print("=" * 60, flush=True)
+    ThreadingHTTPServer(("0.0.0.0", PORT), GameServer).serve_forever()
