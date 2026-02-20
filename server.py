@@ -582,50 +582,65 @@ class GameServer(BaseHTTPRequestHandler):
         """
         Handle POST /robotJoinTable.php
 
-        The SWF calls this endpoint in two situations:
+        Called by the SWF in two situations:
           1. Player explicitly invites the robot from the lobby.
-          2. The SWF's own duplicate-instance detection (SharedObject 5s timer
-             in §_-9g§) fires — when two Flash projectors run from the same PC
-             they share a SharedObject.  The second instance detects a UID
-             mismatch and one client calls robotJoinTable to fall back to solo.
+          2. The duplicate-instance SharedObject timer (§_-9g§) fires after 5s
+             and detects two Flash windows sharing the same local storage.
+             The second instance calls this endpoint — but may NOT send
+             playerUID in the POST body, so uid may be 'anon'.
 
-        In case 2 the table may already be in 'playing' state (multiplayer
-        was started but needs to be unwound).  We handle both cases:
-          - If table is 'open' → normal robot join.
-          - If table is 'playing' and robot_mode is False → game was in
-            multiplayer but needs to switch to robot:  disconnect the guest,
-            reset the table, then robot-join.
+        Strategy:
+          - Try to find the table via uid → session → table_tid  (normal path)
+          - If that fails, try the tableUID param directly
+          - If still nothing, scan ALL tables for any playing, non-robot table
+            and convert the FIRST one found (there's only ever one when playing solo)
         """
+        print(f'  robotJoinTable called: uid={uid!r} params={p}', flush=True)
         with lock:
+            tid = None
+
+            # Path 1: uid → session → table
             sess = sessions.get(uid)
-            if not sess:
-                return
-            tid = p.get("tableUID") or sess.get("table_tid")
+            if sess:
+                tid = p.get("tableUID") or sess.get("table_tid")
+
+            # Path 2: tableUID param directly
+            if not tid:
+                tid = p.get("tableUID")
+
+            # Path 3: scan all tables for a playing non-robot table
             if not tid or tid not in tables:
+                for candidate_tid, t in tables.items():
+                    if t["state"] in ("open", "playing") and not t["robot_mode"]:
+                        tid = candidate_tid
+                        break
+
+            if not tid or tid not in tables:
+                print('  robotJoinTable: no suitable table found', flush=True)
                 return
+
             t = tables[tid]
 
             if t["state"] == "open" and not t["robot_mode"]:
-                # Normal path — table waiting, robot joins now
+                # Table waiting, robot joins now
                 self._robot_join_now(tid)
 
             elif t["state"] == "playing" and not t["robot_mode"]:
-                # Multiplayer game needs to be converted to robot mode.
-                # This happens when the duplicate-player detector fires.
-                # Disconnect the guest (if any), reset, and robot-join.
+                # Multiplayer game → convert to robot mode.
+                # Disconnect the ghost guest (second Flash window), reset, robot-join.
                 guest_uid = t["guest"]
-                if guest_uid and guest_uid in sessions:
+                if guest_uid and guest_uid != ROBOT_UID and guest_uid in sessions:
                     sessions[guest_uid]["table_tid"] = None
                 t["guest"]      = None
                 t["guest_name"] = None
                 t["guest_q"]    = []
                 t["state"]      = "open"
                 t["wait_polls"] = 0
-                # Clear any stale messages that were queued for the (now gone) game
-                t["host_q"]     = []
+                t["host_q"]     = []   # clear stale multiplayer messages
                 self._robot_join_now(tid)
                 print(f'  Multiplayer → robot conversion for table {tid}', flush=True)
-            # else: already robot mode, ignore
+            else:
+                print(f'  robotJoinTable: table {tid} already in robot mode, ignored', flush=True)
 
     # ── robot join ────────────────────────────────────────────────────────────
 
