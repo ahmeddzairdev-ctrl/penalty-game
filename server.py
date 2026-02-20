@@ -283,16 +283,17 @@ class GameServer(BaseHTTPRequestHandler):
         if   "getGameInfo.php"       in path: return self._get_game_info(uid)
         elif "checkUser.php"         in path: return self._check_user(uid, p)
         elif "joinRoom.php"          in path: return self._join_room(uid, p, ip)
-        elif "openTable.php"         in path: self._open_table(uid);          return b""
-        elif "joinTable.php"         in path: self._join_table(uid, p);       return b""
-        elif "inviteToTable.php"     in path: self._invite_to_table(uid, p);  return b""
-        elif "rejectTableInvite.php" in path: self._reject_invite(uid, p);    return b""
-        elif "acceptTableInvite.php" in path: self._join_table(uid, p);       return b""
+        elif "openTable.php"         in path: self._open_table(uid);               return b""
+        elif "joinTable.php"         in path: self._join_table(uid, p);            return b""
+        elif "robotJoinTable.php"    in path: self._robot_join_table(uid, p);      return b""
+        elif "inviteToTable.php"     in path: self._invite_to_table(uid, p);       return b""
+        elif "rejectTableInvite.php" in path: self._reject_invite(uid, p);         return b""
+        elif "acceptTableInvite.php" in path: self._join_table(uid, p);            return b""
         elif "getMessages.php"       in path: return self._get_messages(uid).encode()
-        elif "sendGameMessage.php"   in path: self._game_message(uid, p);     return b""
-        elif "leaveTable.php"        in path: self._leave(uid);               return b""
-        elif "leaveRoom.php"         in path: self._leave(uid);               return b""
-        elif "gameEnded.php"         in path: self._game_ended(uid, p);       return b""
+        elif "sendGameMessage.php"   in path: self._game_message(uid, p);          return b""
+        elif "leaveTable.php"        in path: self._leave(uid);                    return b""
+        elif "leaveRoom.php"         in path: self._leave(uid);                    return b""
+        elif "gameEnded.php"         in path: self._game_ended(uid, p);            return b""
         elif "getMyScore.php"        in path: return b"<root><score>0</score></root>"
         elif "getTopTen.php"         in path: return b"<root></root>"
         else:                                 return b""
@@ -550,9 +551,18 @@ class GameServer(BaseHTTPRequestHandler):
         t["host_q"].append('<STARTPLAYINGRESULT success="true" />')
         t["host_q"].append(f'<PLAYINGSTARTED tableUID="{tid}" randomSeeds="{seeds}" />')
 
-        # Guest sees the host already at the table, then itself, then game starts.
-        # Use OPENTABLERESULT (same as host) — JOINTABLERESULT is not a recognised event.
-        t["guest_q"].append(f'<OPENTABLERESULT success="true" tableUID="{tid}" />')
+        # Guest event sequence:
+        #   JOINTABLERESULT  — confirms the join (guest did NOT open the table)
+        #   PLAYERJOINEDTABLE(host) — host is playerInfos[0] / playerIndex 0
+        #   PLAYERJOINEDTABLE(guest) — guest is playerInfos[1] / playerIndex 1
+        #   STARTPLAYINGRESULT + PLAYINGSTARTED — start the game
+        #
+        # IMPORTANT: do NOT send OPENTABLERESULT to the guest.
+        # If the guest receives OPENTABLERESULT it believes it is the host
+        # (player 0).  Both players then have playerIndex 0 → the sync
+        # barrier waits for index 1 forever → game hangs → sendGameMessage
+        # is never called.  JOINTABLERESULT is the correct event here.
+        t["guest_q"].append(f'<JOINTABLERESULT success="true" tableUID="{tid}" />')
         t["guest_q"].append(player_joined_xml(host_uid, host_name, tid))
         t["guest_q"].append(player_joined_xml(guest_uid, guest_name, tid))
         t["guest_q"].append('<STARTPLAYINGRESULT success="true" />')
@@ -565,6 +575,57 @@ class GameServer(BaseHTTPRequestHandler):
         # Pushing an eager pair here broke the old server.
 
         print(f'MULTIPLAYER: "{host_name}" vs "{guest_name}"', flush=True)
+
+    # ── robotJoinTable ────────────────────────────────────────────────────────
+
+    def _robot_join_table(self, uid, p):
+        """
+        Handle POST /robotJoinTable.php
+
+        The SWF calls this endpoint in two situations:
+          1. Player explicitly invites the robot from the lobby.
+          2. The SWF's own duplicate-instance detection (SharedObject 5s timer
+             in §_-9g§) fires — when two Flash projectors run from the same PC
+             they share a SharedObject.  The second instance detects a UID
+             mismatch and one client calls robotJoinTable to fall back to solo.
+
+        In case 2 the table may already be in 'playing' state (multiplayer
+        was started but needs to be unwound).  We handle both cases:
+          - If table is 'open' → normal robot join.
+          - If table is 'playing' and robot_mode is False → game was in
+            multiplayer but needs to switch to robot:  disconnect the guest,
+            reset the table, then robot-join.
+        """
+        with lock:
+            sess = sessions.get(uid)
+            if not sess:
+                return
+            tid = p.get("tableUID") or sess.get("table_tid")
+            if not tid or tid not in tables:
+                return
+            t = tables[tid]
+
+            if t["state"] == "open" and not t["robot_mode"]:
+                # Normal path — table waiting, robot joins now
+                self._robot_join_now(tid)
+
+            elif t["state"] == "playing" and not t["robot_mode"]:
+                # Multiplayer game needs to be converted to robot mode.
+                # This happens when the duplicate-player detector fires.
+                # Disconnect the guest (if any), reset, and robot-join.
+                guest_uid = t["guest"]
+                if guest_uid and guest_uid in sessions:
+                    sessions[guest_uid]["table_tid"] = None
+                t["guest"]      = None
+                t["guest_name"] = None
+                t["guest_q"]    = []
+                t["state"]      = "open"
+                t["wait_polls"] = 0
+                # Clear any stale messages that were queued for the (now gone) game
+                t["host_q"]     = []
+                self._robot_join_now(tid)
+                print(f'  Multiplayer → robot conversion for table {tid}', flush=True)
+            # else: already robot mode, ignore
 
     # ── robot join ────────────────────────────────────────────────────────────
 
@@ -739,6 +800,12 @@ class GameServer(BaseHTTPRequestHandler):
             leave_table(uid)
 
     # ── HTTP plumbing ─────────────────────────────────────────────────────────
+
+    def do_HEAD(self):
+        """Render.com and load balancers send HEAD for health checks."""
+        self.send_response(200)
+        self.send_header("Content-Type", "text/html")
+        self.end_headers()
 
     def do_OPTIONS(self):
         self._hdrs()
