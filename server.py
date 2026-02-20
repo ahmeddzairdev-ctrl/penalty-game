@@ -622,39 +622,43 @@ class GameServer(BaseHTTPRequestHandler):
             t = tables[tid]
 
             if t["state"] == "open" and not t["robot_mode"]:
-                # Table waiting, robot joins now
-                self._robot_join_now(tid)
+                # Fresh table waiting → full robot join sequence
+                self._robot_join_now(tid, already_playing=False)
 
             elif t["state"] == "playing" and not t["robot_mode"]:
-                # Multiplayer game → convert to robot mode.
-                # Disconnect the ghost guest (second Flash window), reset, robot-join.
+                # Multiplayer → robot conversion.
+                # The host already received OPENTABLERESULT + PLAYERJOINEDTABLE(self)
+                # + PLAYERJOINEDTABLE(guest) + STARTPLAYINGRESULT + PLAYINGSTARTED
+                # from the multiplayer join.  They also already sent gamePlay via
+                # sendGameMessage which went to the (now cleared) guest_q.
+                # DO NOT send STARTPLAYINGRESULT + PLAYINGSTARTED again — the SWF
+                # will ignore or mishandle a second PLAYINGSTARTED.
+                # Just send ROBOTJOINTABLERESULT + ROBOTJOINEDTABLE to signal robot
+                # mode, then the proactive gamePlay pair to complete the sync barrier.
                 guest_uid = t["guest"]
                 if guest_uid and guest_uid != ROBOT_UID and guest_uid in sessions:
                     sessions[guest_uid]["table_tid"] = None
-                t["guest"]      = None
-                t["guest_name"] = None
+                t["guest"]      = ROBOT_UID
+                t["guest_name"] = ROBOT_NAME
                 t["guest_q"]    = []
-                t["state"]      = "open"
+                t["robot_mode"] = True
                 t["wait_polls"] = 0
-                t["host_q"]     = []   # clear stale multiplayer messages
-                self._robot_join_now(tid)
+                # Clear any stale multiplayer messages queued for host
+                t["host_q"] = []
+                # Switch SWF to robot mode and complete the gamePlay sync barrier
+                t["host_q"].append('<ROBOTJOINTABLERESULT success="true" />')
+                t["host_q"].append(f'<ROBOTJOINEDTABLE tableUID="{tid}" />')
+                t["host_q"].append(sync_push_pair("gamePlay"))
                 print(f'  Multiplayer → robot conversion for table {tid}', flush=True)
             else:
                 print(f'  robotJoinTable: table {tid} already in robot mode, ignored', flush=True)
 
     # ── robot join ────────────────────────────────────────────────────────────
 
-    def _robot_join_now(self, tid):
+    def _robot_join_now(self, tid, already_playing=False):
         """
-        Trigger immediate robot join on a specific table.
-
-        The SWF's §_-7f§ has built-in robot AI via robotSendGameMessage.
-        Server must:
-          1. Send PLAYERJOINEDTABLE with a fake robot UID/name so the lobby
-             knows there are 2 players and calls startGame (fixes "2 players needed").
-          2. In _relay / robot response, handle SYNC functions by pushing both
-             playerIndex 0 and 1 — because there's no real player 1 to do it.
-        Caller MUST hold lock.
+        Trigger robot join for a fresh (open) table.  Caller MUST hold lock.
+        For multiplayer→robot conversion use _robot_join_table directly.
         """
         if tid not in tables:
             return
@@ -663,15 +667,26 @@ class GameServer(BaseHTTPRequestHandler):
             return
         t["robot_mode"] = True
         t["state"]      = "playing"
-        t["guest"]      = ROBOT_UID          # treat robot as guest for q routing
+        t["guest"]      = ROBOT_UID
         t["guest_name"] = ROBOT_NAME
         seeds = random_seeds()
-        # ROBOTJOINTABLERESULT tells the SWF to switch to robot mode
-        t["host_q"].append('<ROBOTJOINTABLERESULT success="true" />')
-        # PLAYERJOINEDTABLE with robot info so lobby knows seat 2 is filled
-        t["host_q"].append(player_joined_xml(ROBOT_UID, ROBOT_NAME, tid))
-        t["host_q"].append('<STARTPLAYINGRESULT success="true" />')
-        t["host_q"].append(f'<PLAYINGSTARTED tableUID="{tid}" randomSeeds="{seeds}" />')
+
+        # Poll N: robot announces join
+        t["host_q"].append(
+            '<ROBOTJOINTABLERESULT success="true" />'
+            f'<ROBOTJOINEDTABLE tableUID="{tid}" />'
+        )
+        # Poll N+1: game starts
+        t["host_q"].append(
+            '<STARTPLAYINGRESULT success="true" />'
+            f'<PLAYINGSTARTED tableUID="{tid}" randomSeeds="{seeds}" />'
+        )
+        # Poll N+2: gamePlay sync pair — MUST be pushed eagerly.
+        # The SWF in robot mode waits for the server to push gamePlay (both
+        # playerIndex 0 and 1) before firing the sync barrier.  It does NOT
+        # send gamePlay itself first.
+        t["host_q"].append(sync_push_pair("gamePlay"))
+
         print(f'ROBOT joined table {tid}', flush=True)
 
     # ── getMessages (polling loop) ────────────────────────────────────────────
@@ -738,23 +753,74 @@ class GameServer(BaseHTTPRequestHandler):
             t = tables[tid]
 
             if t["robot_mode"]:
-                # In robot mode, the SWF's built-in AI handles game moves via
-                # robotSendGameMessage (client-side). But SYNC functions need the
-                # server to fake the robot's response — because there's no real
-                # player 1 to send its side of the sync. We push BOTH playerIndex
-                # 0 (human, what they just sent) and playerIndex 1 (robot) so
-                # the sync barrier fires immediately.
-                if fn in SYNC_FNS:
-                    node0 = push_node(fn, *params, sync_string=fn, player_index=0)
-                    node1 = push_node(fn, *params, sync_string=fn, player_index=1)
-                    t["host_q"].append(node0)
-                    t["host_q"].append(node1)
-                # ASYNC functions in robot mode: the SWF handles them via
-                # robotSendGameMessage internally — server does nothing.
+                self._robot_respond(t, fn, params)
             else:
                 self._relay(t, uid, fn, params)
 
         print(f'  {sessions.get(uid, {}).get("name", "?")} -> {fn}', flush=True)
+
+    # ── robot AI (ported from v21 _robot_respond) ────────────────────────────
+
+    def _robot_respond(self, t, fn, params):
+        """
+        Full robot AI from v21.  Queues the appropriate server push in response
+        to each player game message.  Caller MUST hold lock.
+
+        SYNC functions: push both playerIndex 0+1 (sync_push_pair).
+        ASYNC functions: push single playerIndex 1 node (push_node async).
+        """
+
+        if fn == "gamePlay":
+            # In robot mode gamePlay is handled eagerly (pushed after PLAYINGSTARTED).
+            # If player sends it anyway (rematch), push the pair again.
+            t["host_q"].append(sync_push_pair("gamePlay"))
+
+        elif fn == "chooseTeamEnded":
+            t0 = int(params[0]) if len(params) > 0 else 0
+            t1 = int(params[1]) if len(params) > 1 else 1
+            print(f'  Teams: player={t0} robot={t1}', flush=True)
+            if t0 == t1:
+                # Same team → robot queues jersey-choice event (async)
+                t["host_q"].append(
+                    push_node("homeJerseyIsChosen", sync_string=None, player_index=1)
+                )
+
+        elif fn in ("homeJerseyIsChosen", "awayJerseyIsChosen"):
+            # Jersey resolved; nothing more to push, penalty rounds start
+            pass
+
+        elif fn == "startShoot":
+            # Robot's turn to shoot — send random coordinates
+            rx = random.uniform(250, 550)
+            ry = random.uniform(80, 200)
+            print(f'  Robot shoots ({rx:.0f}, {ry:.0f})', flush=True)
+            t["host_q"].append(
+                push_node("opponentShooterShooted", rx, ry,
+                          sync_string=None, player_index=1)
+            )
+
+        elif fn == "opponentShooterShooted":
+            # Player kicked — robot goalkeeper dives
+            rx = random.uniform(200, 600)
+            ry = random.uniform(100, 220)
+            dt = float(random.randint(150, 500))
+            print(f'  Robot dives ({rx:.0f}, {ry:.0f}) dt={dt:.0f}ms', flush=True)
+            t["host_q"].append(
+                push_node("opponentGoalkeeperJumped", rx, ry, dt,
+                          sync_string=None, player_index=1)
+            )
+
+        elif fn == "opponentGoalkeeperJumped":
+            # Player dove — nothing to push, physics resolves result
+            pass
+
+        elif fn == "opponentGoal":
+            print(f'  Robot scored!', flush=True)
+
+        elif fn == "opponentMissed":
+            print(f'  Robot missed!', flush=True)
+
+        # Anything else: ignore (SWF's own robotSendGameMessage handles it)
 
     # ── relay (2-player game messages) ───────────────────────────────────────
 
