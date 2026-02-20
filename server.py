@@ -604,18 +604,18 @@ class GameServer(BaseHTTPRequestHandler):
         with lock:
             sess = sessions.get(uid)
             if not sess:
-                return "<root/>"
+                return ""
 
             # ── Inbox: invites / rejections for wandering players ──────────
             inbox = sess.get("inbox")
             if inbox:
                 out = "".join(inbox)
                 sess["inbox"] = []
-                return f"<root>{out}</root>"
+                return out
 
             tid = sess.get("table_tid")
             if not tid or tid not in tables:
-                return "<root/>"
+                return ""
             t = tables[tid]
 
             # ── Auto robot-join (only the host polls count) ────────────────
@@ -626,8 +626,7 @@ class GameServer(BaseHTTPRequestHandler):
                 if t["wait_polls"] >= limit:
                     self._robot_join_now(tid)
 
-            out = q_pop(t, uid)
-            return f"<root>{out}</root>" if out else "<root/>"
+            return q_pop(t, uid)
 
     # ── sendGameMessage ───────────────────────────────────────────────────────
 
