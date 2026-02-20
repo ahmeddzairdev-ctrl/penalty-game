@@ -154,6 +154,9 @@ ASYNC_FNS = {
 # Table helpers
 # ══════════════════════════════════════════════════════════════════════════════
 
+ROBOT_UID  = "999999"
+ROBOT_NAME = "Robot"
+
 def new_table(tid, host_uid, host_name):
     return dict(
         tid=tid,
@@ -163,6 +166,13 @@ def new_table(tid, host_uid, host_name):
         host_q=[],      guest_q=[],
         wait_polls=0,
         robot_mode=False,
+    )
+
+def player_joined_xml(uid, name, table_uid):
+    """PLAYERJOINEDTABLE with full player info so the lobby can build playerInfos."""
+    return (
+        f'<PLAYERJOINEDTABLE playerUID="{uid}" playerName="{_escape(name)}" '
+        f'playerGender="1" tableUID="{table_uid}" />'
     )
 
 
@@ -393,7 +403,7 @@ class GameServer(BaseHTTPRequestHandler):
             sess["table_tid"] = tid
             t = tables[tid]
             t["host_q"].append(f'<OPENTABLERESULT success="true" tableUID="{tid}" />')
-            t["host_q"].append(f'<PLAYERJOINEDTABLE playerUID="{uid}" tableUID="{tid}" />')
+            t["host_q"].append(player_joined_xml(uid, sess["name"], tid))
         print(f'-> "{sess["name"]}" opened table — waiting for opponent', flush=True)
 
     # ── joinTable ─────────────────────────────────────────────────────────────
@@ -439,7 +449,7 @@ class GameServer(BaseHTTPRequestHandler):
             sess["table_tid"] = tid
             t = tables[tid]
             t["host_q"].append(f'<OPENTABLERESULT success="true" tableUID="{tid}" />')
-            t["host_q"].append(f'<PLAYERJOINEDTABLE playerUID="{uid}" tableUID="{tid}" />')
+            t["host_q"].append(player_joined_xml(uid, sess["name"], tid))
 
     # ── inviteToTable ─────────────────────────────────────────────────────────
 
@@ -536,21 +546,15 @@ class GameServer(BaseHTTPRequestHandler):
         seeds = random_seeds()
 
         # Host learns the guest joined, then game starts
-        t["host_q"].append(
-            f'<PLAYERJOINEDTABLE playerUID="{guest_uid}" tableUID="{tid}" />'
-        )
+        t["host_q"].append(player_joined_xml(guest_uid, guest_name, tid))
         t["host_q"].append('<STARTPLAYINGRESULT success="true" />')
         t["host_q"].append(f'<PLAYINGSTARTED tableUID="{tid}" randomSeeds="{seeds}" />')
 
         # Guest sees the host already at the table, then itself, then game starts.
-        # Guest gets JOINTABLERESULT — it didn't open this table.
-        t["guest_q"].append(f'<JOINTABLERESULT success="true" tableUID="{tid}" />')
-        t["guest_q"].append(
-            f'<PLAYERJOINEDTABLE playerUID="{host_uid}" tableUID="{tid}" />'
-        )
-        t["guest_q"].append(
-            f'<PLAYERJOINEDTABLE playerUID="{guest_uid}" tableUID="{tid}" />'
-        )
+        # Use OPENTABLERESULT (same as host) — JOINTABLERESULT is not a recognised event.
+        t["guest_q"].append(f'<OPENTABLERESULT success="true" tableUID="{tid}" />')
+        t["guest_q"].append(player_joined_xml(host_uid, host_name, tid))
+        t["guest_q"].append(player_joined_xml(guest_uid, guest_name, tid))
         t["guest_q"].append('<STARTPLAYINGRESULT success="true" />')
         t["guest_q"].append(f'<PLAYINGSTARTED tableUID="{tid}" randomSeeds="{seeds}" />')
 
@@ -567,8 +571,13 @@ class GameServer(BaseHTTPRequestHandler):
     def _robot_join_now(self, tid):
         """
         Trigger immediate robot join on a specific table.
-        The SWF (§_-7f§) has its own built-in robot AI driven by
-        robotSendGameMessage — the server never needs to generate moves.
+
+        The SWF's §_-7f§ has built-in robot AI via robotSendGameMessage.
+        Server must:
+          1. Send PLAYERJOINEDTABLE with a fake robot UID/name so the lobby
+             knows there are 2 players and calls startGame (fixes "2 players needed").
+          2. In _relay / robot response, handle SYNC functions by pushing both
+             playerIndex 0 and 1 — because there's no real player 1 to do it.
         Caller MUST hold lock.
         """
         if tid not in tables:
@@ -578,9 +587,13 @@ class GameServer(BaseHTTPRequestHandler):
             return
         t["robot_mode"] = True
         t["state"]      = "playing"
+        t["guest"]      = ROBOT_UID          # treat robot as guest for q routing
+        t["guest_name"] = ROBOT_NAME
         seeds = random_seeds()
+        # ROBOTJOINTABLERESULT tells the SWF to switch to robot mode
         t["host_q"].append('<ROBOTJOINTABLERESULT success="true" />')
-        t["host_q"].append(f'<ROBOTJOINEDTABLE tableUID="{tid}" />')
+        # PLAYERJOINEDTABLE with robot info so lobby knows seat 2 is filled
+        t["host_q"].append(player_joined_xml(ROBOT_UID, ROBOT_NAME, tid))
         t["host_q"].append('<STARTPLAYINGRESULT success="true" />')
         t["host_q"].append(f'<PLAYINGSTARTED tableUID="{tid}" randomSeeds="{seeds}" />')
         print(f'ROBOT joined table {tid}', flush=True)
@@ -591,18 +604,18 @@ class GameServer(BaseHTTPRequestHandler):
         with lock:
             sess = sessions.get(uid)
             if not sess:
-                return ""
+                return "<root/>"
 
             # ── Inbox: invites / rejections for wandering players ──────────
             inbox = sess.get("inbox")
             if inbox:
                 out = "".join(inbox)
                 sess["inbox"] = []
-                return out
+                return f"<root>{out}</root>"
 
             tid = sess.get("table_tid")
             if not tid or tid not in tables:
-                return ""
+                return "<root/>"
             t = tables[tid]
 
             # ── Auto robot-join (only the host polls count) ────────────────
@@ -613,7 +626,8 @@ class GameServer(BaseHTTPRequestHandler):
                 if t["wait_polls"] >= limit:
                     self._robot_join_now(tid)
 
-            return q_pop(t, uid)
+            out = q_pop(t, uid)
+            return f"<root>{out}</root>" if out else "<root/>"
 
     # ── sendGameMessage ───────────────────────────────────────────────────────
 
@@ -649,8 +663,19 @@ class GameServer(BaseHTTPRequestHandler):
             t = tables[tid]
 
             if t["robot_mode"]:
-                # SWF runs its own robot AI — server does nothing here.
-                pass
+                # In robot mode, the SWF's built-in AI handles game moves via
+                # robotSendGameMessage (client-side). But SYNC functions need the
+                # server to fake the robot's response — because there's no real
+                # player 1 to send its side of the sync. We push BOTH playerIndex
+                # 0 (human, what they just sent) and playerIndex 1 (robot) so
+                # the sync barrier fires immediately.
+                if fn in SYNC_FNS:
+                    node0 = push_node(fn, *params, sync_string=fn, player_index=0)
+                    node1 = push_node(fn, *params, sync_string=fn, player_index=1)
+                    t["host_q"].append(node0)
+                    t["host_q"].append(node1)
+                # ASYNC functions in robot mode: the SWF handles them via
+                # robotSendGameMessage internally — server does nothing.
             else:
                 self._relay(t, uid, fn, params)
 
